@@ -964,6 +964,193 @@ func hasDeleteReclaimPolicy(obj map[string]interface{}) bool {
 	return policy == string(v1.PersistentVolumeReclaimDelete)
 }
 
+func waitForReady(
+	watchChan <-chan watch.Event,
+	name string,
+	ready func(runtime.Unstructured) bool,
+	timeout time.Duration,
+	log logrus.FieldLogger,
+) (*unstructured.Unstructured, error) {
+	var timeoutChan <-chan time.Time
+	if timeout != 0 {
+		timeoutChan = time.After(timeout)
+	} else {
+		timeoutChan = make(chan time.Time)
+	}
+
+	for {
+		select {
+		case event := <-watchChan:
+			if event.Type != watch.Added && event.Type != watch.Modified {
+				continue
+			}
+
+			obj, ok := event.Object.(*unstructured.Unstructured)
+			switch {
+			case !ok:
+				log.Errorf("Unexpected type %T", event.Object)
+				continue
+			case obj.GetName() != name:
+				continue
+			case !ready(obj):
+				log.Debugf("Item %s is not ready yet", name)
+				continue
+			default:
+				return obj, nil
+			}
+		case <-timeoutChan:
+			return nil, errors.New("failed to observe item becoming ready within the timeout")
+		}
+	}
+}
+
+type PVRestorer interface {
+	executePVAction(obj *unstructured.Unstructured) (*unstructured.Unstructured, error)
+}
+
+type pvRestorer struct {
+	logger                 logrus.FieldLogger
+	backup                 *api.Backup
+	snapshotVolumes        *bool
+	restorePVs             *bool
+	volumeSnapshots        []*volume.Snapshot
+	blockStoreGetter       BlockStoreGetter
+	snapshotLocationLister listers.VolumeSnapshotLocationLister
+}
+
+type snapshotInfo struct {
+	providerSnapshotID string
+	volumeType         string
+	volumeAZ           string
+	volumeIOPS         *int64
+	location           *api.VolumeSnapshotLocation
+}
+
+func getSnapshotInfo(pvName string, backup *api.Backup, volumeSnapshots []*volume.Snapshot, snapshotLocationLister listers.VolumeSnapshotLocationLister) (*snapshotInfo, error) {
+	// pre-v0.10 backup
+	if backup.Status.VolumeBackups != nil {
+		volumeBackup := backup.Status.VolumeBackups[pvName]
+		if volumeBackup == nil {
+			return nil, nil
+		}
+
+		locations, err := snapshotLocationLister.VolumeSnapshotLocations(backup.Namespace).List(labels.Everything())
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if len(locations) != 1 {
+			return nil, errors.Errorf("unable to restore pre-v0.10 volume snapshot because exactly one volume snapshot location must exist, got %d", len(locations))
+		}
+
+		return &snapshotInfo{
+			providerSnapshotID: volumeBackup.SnapshotID,
+			volumeType:         volumeBackup.Type,
+			volumeAZ:           volumeBackup.AvailabilityZone,
+			volumeIOPS:         volumeBackup.Iops,
+			location:           locations[0],
+		}, nil
+	}
+
+	// v0.10+ backup
+	var pvSnapshot *volume.Snapshot
+	for _, snapshot := range volumeSnapshots {
+		if snapshot.Spec.PersistentVolumeName == pvName {
+			pvSnapshot = snapshot
+			break
+		}
+	}
+
+	if pvSnapshot == nil {
+		return nil, nil
+	}
+
+	loc, err := snapshotLocationLister.VolumeSnapshotLocations(backup.Namespace).Get(pvSnapshot.Spec.Location)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	return &snapshotInfo{
+		providerSnapshotID: pvSnapshot.Status.ProviderSnapshotID,
+		volumeType:         pvSnapshot.Spec.VolumeType,
+		volumeAZ:           pvSnapshot.Spec.VolumeAZ,
+		volumeIOPS:         pvSnapshot.Spec.VolumeIOPS,
+		location:           loc,
+	}, nil
+}
+
+func (r *pvRestorer) executePVAction(obj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	pvName := obj.GetName()
+	if pvName == "" {
+		return nil, errors.New("PersistentVolume is missing its name")
+	}
+
+	// It's simpler to just access the spec through the unstructured object than to convert
+	// to structured and back here, especially since the SetVolumeID(...) call below needs
+	// the unstructured representation (and does a conversion internally).
+	res, ok := obj.Object["spec"]
+	if !ok {
+		return nil, errors.New("spec not found")
+	}
+	spec, ok := res.(map[string]interface{})
+	if !ok {
+		return nil, errors.Errorf("spec was of type %T, expected map[string]interface{}", res)
+	}
+
+	delete(spec, "claimRef")
+
+	if boolptr.IsSetToFalse(r.snapshotVolumes) {
+		// The backup had snapshots disabled, so we can return early
+		return obj, nil
+	}
+
+	if boolptr.IsSetToFalse(r.restorePVs) {
+		// The restore has pv restores disabled, so we can return early
+		return obj, nil
+	}
+
+	log := r.logger.WithFields(logrus.Fields{"persistentVolume": pvName})
+
+	snapshotInfo, err := getSnapshotInfo(pvName, r.backup, r.volumeSnapshots, r.snapshotLocationLister)
+	if err != nil {
+		return nil, err
+	}
+	if snapshotInfo == nil {
+		log.Infof("No snapshot found for persistent volume")
+		return obj, nil
+	}
+
+	blockStore, err := r.blockStoreGetter.GetBlockStore(snapshotInfo.location.Spec.Provider)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	if err := blockStore.Init(snapshotInfo.location.Spec.Config); err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	volumeID, err := blockStore.CreateVolumeFromSnapshot(snapshotInfo.providerSnapshotID, snapshotInfo.volumeType, snapshotInfo.volumeAZ, snapshotInfo.volumeIOPS)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	log.WithField("providerSnapshotID", snapshotInfo.providerSnapshotID).Info("successfully restored persistent volume from snapshot")
+
+	updated1, err := blockStore.SetVolumeID(obj, volumeID)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	updated2, ok := updated1.(*unstructured.Unstructured)
+	if !ok {
+		return nil, errors.Errorf("unexpected type %T", updated1)
+	}
+	return updated2, nil
+}
+
+func isPVReady(obj runtime.Unstructured) bool {
+	phase, _, _ := unstructured.NestedString(obj.UnstructuredContent(), "status", "phase")
+	return phase == string(v1.VolumeAvailable)
+}
+
 func resetMetadataAndStatus(obj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
 	res, ok := obj.Object["metadata"]
 	if !ok {
